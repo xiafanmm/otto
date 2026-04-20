@@ -43,7 +43,7 @@ DEFAULT_MAX_WORKERS = 4
 
 WORK_LOOKBACK = 2
 WORK_RECENT_THRESHOLD: int | None = None
-WORK_WEIGHTS: dict[str, float] = {}
+WORK_WEIGHTS: dict[str, int] = {}
 WORK_TMP_DIR = ""
 
 
@@ -55,9 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-version", default="base")
-    parser.add_argument("--click-weight", type=float, required=True)
-    parser.add_argument("--cart-weight", type=float, required=True)
-    parser.add_argument("--order-weight", type=float, required=True)
+    parser.add_argument("--click-weight", type=int, required=True)
+    parser.add_argument("--cart-weight", type=int, required=True)
+    parser.add_argument("--order-weight", type=int, required=True)
     parser.add_argument("--n-lookback", type=int, default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--n-workers", type=int, default=None)
@@ -154,7 +154,7 @@ def prepare_frame(
     df: pd.DataFrame,
     *,
     recent_threshold: int | None,
-    weights: dict[str, float],
+    weights: dict[str, int],
 ) -> pd.DataFrame:
     # 这里做轻量预处理：按需截最近 14 天、把 type 映射成权重，并按 session/ts 排序。
     if recent_threshold is not None:
@@ -165,7 +165,7 @@ def prepare_frame(
 
     df = df.copy()
     df["type_name"] = normalize_type_column(df["type"])
-    df["weight"] = df["type_name"].map(weights).astype("float32")
+    df["weight"] = df["type_name"].map(weights).astype("int16")
     return (
         df[["session", "ts", "aid", "weight"]]
         .sort_values(["session", "ts"], kind="stable")
@@ -181,7 +181,7 @@ def count_covisitation(df: pd.DataFrame, n_lookback: int) -> pd.DataFrame:
 
     sessions = df["session"].to_numpy()
     aids = df["aid"].to_numpy()
-    weights = df["weight"].to_numpy(dtype=np.float32)
+    weights = df["weight"].to_numpy(dtype=np.int16)
 
     pair_frames: list[pd.DataFrame] = []
     for lag in range(1, n_lookback + 1):
@@ -212,17 +212,20 @@ def count_covisitation(df: pd.DataFrame, n_lookback: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["aid_key", "aid_future", "score"])
 
     pairs = pd.concat(pair_frames, ignore_index=True)
-    return (
-        pairs.groupby(["aid_key", "aid_future"], as_index=False, sort=False)["score"]
-        .sum()
-        .astype({"aid_key": "int64", "aid_future": "int64", "score": "float32"})
+    agg = (
+        pairs.groupby(["aid_key", "aid_future"], as_index=False, sort=False)
+        .agg(score=("score", "sum"))
     )
+    agg["aid_key"] = agg["aid_key"].astype("int64")
+    agg["aid_future"] = agg["aid_future"].astype("int64")
+    agg["score"] = agg["score"].astype("int32")
+    return agg
 
 
 def init_worker(
     n_lookback: int,
     recent_threshold: int | None,
-    weights: dict[str, float],
+    weights: dict[str, int],
     tmp_dir: str,
 ) -> None:
     # 多进程 worker 初始化共享只读配置，避免每个任务都重复传大对象。
@@ -254,23 +257,23 @@ def process_shard(parquet_path_str: str) -> str | None:
     return str(shard_output)
 
 
-def merge_partial_counts(partial_files: list[Path]) -> dict[tuple[int, int], float]:
+def merge_partial_counts(partial_files: list[Path]) -> dict[tuple[int, int], int]:
     # 把各个 shard 的局部共现分数合并成全局 pair -> score 字典。
-    merged: dict[tuple[int, int], float] = defaultdict(float)
+    merged: dict[tuple[int, int], int] = defaultdict(int)
     for partial_file in tqdm(partial_files, desc="merge partial counts"):
         partial_df = pd.read_pickle(partial_file)
         for aid_key, aid_future, score in partial_df.itertuples(index=False):
-            merged[(int(aid_key), int(aid_future))] += float(score)
+            merged[(int(aid_key), int(aid_future))] += int(score)
     return merged
 
 
 def build_count_info_list(
-    merged_scores: dict[tuple[int, int], float],
+    merged_scores: dict[tuple[int, int], int],
     topk: int,
 ) -> list[Any]:
     # 最终输出格式沿用原始比赛代码风格：
     # list[aid_key] = [候选 aid 列表, 对应 score 列表]
-    by_aid: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    by_aid: dict[int, list[tuple[int, int]]] = defaultdict(list)
     max_aid = -1
 
     for (aid_key, aid_future), score in merged_scores.items():
@@ -299,7 +302,7 @@ def write_metadata(
     exp_name: str,
     input_dir: Path,
     weight_version: str,
-    weights: dict[str, float],
+    weights: dict[str, int],
     n_lookback: int,
     topk: int,
     n_workers: int,
@@ -315,7 +318,7 @@ def write_metadata(
         "weight_version": weight_version,
         "weights": weights,
         "n_lookback": n_lookback,
-        "topk": topk,
+        "topk": topk,1
         "n_workers": n_workers,
         "n_shards": n_shards,
         "recent_threshold": recent_threshold,
