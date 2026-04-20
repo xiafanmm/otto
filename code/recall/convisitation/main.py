@@ -103,7 +103,10 @@ def get_recent_threshold(parquet_files: list[Path]) -> int | None:
                 raise RuntimeError(
                     f"parquet footer missing ts max stats: {path} row_group={rg}"
                 )
-            candidate = int(stats.max)
+            candidate = require_int_like(
+                stats.max,
+                context=f"parquet footer ts max stats for {path} row_group={rg}",
+            )
             max_ts = candidate if max_ts is None else max(max_ts, candidate)
     if max_ts is None:
         return None
@@ -272,8 +275,22 @@ def merge_partial_counts(partial_files: list[Path]) -> pl.DataFrame:
         pl.scan_parquet([str(path) for path in partial_files])
         .group_by(["aid_key", "aid_future"])
         .agg(pl.col("score").sum().cast(pl.Int64))
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
+
+
+def require_int_like(value: object, *, context: str) -> int:
+    # polars/pyarrow 的类型桩会把很多聚合结果标成宽泛的 literal union；
+    # 这里显式收窄成整数，避免静态检查误报，同时保留运行时校验。
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        return int(value)
+    raise TypeError(f"{context} must be an integer, got {type(value).__name__}")
+
+
+def require_list_value(value: object, *, context: str) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    raise TypeError(f"{context} must be a list, got {type(value).__name__}")
 
 
 def build_count_info_list(merged_scores: pl.DataFrame, topk: int) -> list[Any]:
@@ -295,14 +312,23 @@ def build_count_info_list(merged_scores: pl.DataFrame, topk: int) -> list[Any]:
         .collect()
     )
 
-    max_aid = int(ranked["aid_key"].max())
+    max_aid_value = ranked["aid_key"].max()
+    if max_aid_value is None:
+        return []
+
+    max_aid = require_int_like(max_aid_value, context="ranked aid_key max")
     count_info_list: list[Any] = [-1] * (max_aid + 1)
-    for aid_key, aid_future_list, score_list in tqdm(
+    for aid_key_value, aid_future_value, score_value in tqdm(
         ranked.iter_rows(), total=len(ranked), desc="build topk"
     ):
-        count_info_list[int(aid_key)] = [
-            list(aid_future_list),
-            list(score_list),
+        aid_key = require_int_like(aid_key_value, context="ranked aid_key")
+        aid_future_list = require_list_value(
+            aid_future_value, context="ranked aid_future"
+        )
+        score_list = require_list_value(score_value, context="ranked score")
+        count_info_list[aid_key] = [
+            aid_future_list,
+            score_list,
         ]
     return count_info_list
 
