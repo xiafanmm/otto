@@ -100,7 +100,7 @@ def get_recent_threshold(parquet_files: list[Path]) -> int | None:
         ts_idx = metadata.schema.names.index("ts")
         for rg in range(metadata.num_row_groups):
             stats = metadata.row_group(rg).column(ts_idx).statistics
-            if stats is None or not stats.has_max_value:
+            if stats is None or not stats.has_min_max:
                 raise RuntimeError(
                     f"parquet footer missing ts max stats: {path} row_group={rg}"
                 )
