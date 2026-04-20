@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import polars as pl
+import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
 from code.utils import LOG_DIR, ensure_dir, log_duration, setup_logger
@@ -91,15 +92,22 @@ def should_use_recent_window(weight_version: str) -> bool:
 
 
 def get_recent_threshold(parquet_files: list[Path]) -> int | None:
-    # 纯 polars 路线：用 lazy scan 直接算全局 max(ts)，避免重复写 parquet backend 分支。
-    max_ts_df = (
-        pl.scan_parquet([str(path) for path in parquet_files])
-        .select(pl.col("ts").max().alias("max_ts"))
-        .collect()
-    )
-    if max_ts_df.is_empty():
+    # 只读 parquet footer 里每个 row group 的 column statistics 取 max(ts)，
+    # 主进程不触发 polars/rayon 线程池，避免后续 fork 时继承污染的线程状态。
+    max_ts: int | None = None
+    for path in parquet_files:
+        metadata = pq.ParquetFile(str(path)).metadata
+        ts_idx = metadata.schema.names.index("ts")
+        for rg in range(metadata.num_row_groups):
+            stats = metadata.row_group(rg).column(ts_idx).statistics
+            if stats is None or not stats.has_max_value:
+                raise RuntimeError(
+                    f"parquet footer missing ts max stats: {path} row_group={rg}"
+                )
+            candidate = int(stats.max)
+            max_ts = candidate if max_ts is None else max(max_ts, candidate)
+    if max_ts is None:
         return None
-    max_ts = max_ts_df.item(0, "max_ts")
     return max_ts - 60 * 60 * 24 * 1000 * 14
 
 
@@ -387,7 +395,9 @@ def main() -> None:
                     partial_files.append(Path(partial))
         else:
             # 多进程模式按 shard 并行，最后只合并局部统计结果。
-            with get_context("fork").Pool(
+            # 用 forkserver：子进程从一个干净的 server 进程 fork，
+            # 不会继承 main 进程里已经启动的 polars/rayon 线程池状态。
+            with get_context("forkserver").Pool(
                 processes=n_workers,
                 initializer=init_worker,
                 initargs=init_args,
