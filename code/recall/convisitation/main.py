@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-lookback", type=int, default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--n-workers", type=int, default=None)
+    parser.add_argument("--max-shards", type=int, default=None)
     return parser.parse_args()
 
 
@@ -115,6 +116,9 @@ def get_n_workers(override: int | None) -> int:
 
 def discover_parquet_files(input_dir: Path) -> list[Path]:
     # 当前项目既支持传 raw/validation 这样的父目录，也支持直接传 parquet 目录。
+    if input_dir.is_file():
+        return [input_dir]
+
     train_dir = input_dir / "train_parquet"
     test_dir = input_dir / "test_parquet"
 
@@ -132,13 +136,9 @@ def discover_parquet_files(input_dir: Path) -> list[Path]:
 
 
 def read_parquet_file(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
-    # 统一走 polars 读 parquet，再转 pandas，避免额外依赖 pyarrow / fastparquet。
-    try:
-        return pl.read_parquet(path, columns=columns).to_pandas()
-    except ImportError as exc:
-        raise RuntimeError(
-            "Reading parquet requires polars. Install polars before running covisitation."
-        ) from exc
+    # 统一走 polars 读 parquet，但避免调用 to_pandas()，因为那会额外要求 pyarrow。
+    frame = pl.read_parquet(path, columns=columns)
+    return pd.DataFrame(frame.to_dict(as_series=False))
 
 
 def normalize_type_column(series: pd.Series) -> pd.Series:
@@ -374,6 +374,10 @@ def main() -> None:
     init_args = (n_lookback, recent_threshold, weights, str(tmp_dir))
 
     try:
+        if args.max_shards is not None:
+            parquet_files = parquet_files[: max(1, args.max_shards)]
+            logger.info("debug mode: only processing first %s parquet shard(s)", len(parquet_files))
+
         if n_workers == 1:
             # 单进程模式下直接串行处理，便于本地调试。
             init_worker(*init_args)

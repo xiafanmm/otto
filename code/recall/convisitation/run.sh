@@ -15,6 +15,8 @@ WEIGHT_VERSION="${CONVIS_WEIGHT_VERSION:-base}"
 CLICK_WEIGHT="${CONVIS_CLICK_WEIGHT:-}"
 CART_WEIGHT="${CONVIS_CART_WEIGHT:-}"
 ORDER_WEIGHT="${CONVIS_ORDER_WEIGHT:-}"
+N_WORKERS="${CONVIS_N_WORKERS:-}"
+MAX_SHARDS="${CONVIS_MAX_SHARDS:-}"
 
 # 预设一组常用权重版本，便于做消融实验。
 resolve_weight_preset() {
@@ -66,9 +68,17 @@ while [[ $# -gt 0 ]]; do
       ORDER_WEIGHT="$2"
       shift 2
       ;;
+    --n-workers)
+      N_WORKERS="$2"
+      shift 2
+      ;;
+    --max-shards)
+      MAX_SHARDS="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument for convisitation/run.sh: $1" >&2
-      echo "Usage: $0 [train|submit] [--weight-version VERSION] [--click-weight N --cart-weight N --order-weight N]" >&2
+      echo "Usage: $0 [train|submit] [--weight-version VERSION] [--click-weight N --cart-weight N --order-weight N] [--n-workers N] [--max-shards N]" >&2
       exit 1
       ;;
   esac
@@ -80,7 +90,7 @@ CLICK_WEIGHT="${CLICK_WEIGHT:-${PRESET_CLICK_WEIGHT}}"
 CART_WEIGHT="${CART_WEIGHT:-${PRESET_CART_WEIGHT}}"
 ORDER_WEIGHT="${ORDER_WEIGHT:-${PRESET_ORDER_WEIGHT}}"
 
-echo "[config] convisitation weights version=${WEIGHT_VERSION} clicks=${CLICK_WEIGHT} carts=${CART_WEIGHT} orders=${ORDER_WEIGHT}"
+echo "[config] convisitation weights version=${WEIGHT_VERSION} clicks=${CLICK_WEIGHT} carts=${CART_WEIGHT} orders=${ORDER_WEIGHT} n_workers=${N_WORKERS:-auto} max_shards=${MAX_SHARDS:-all}"
 
 case "${MODE}" in
   train)
@@ -94,7 +104,9 @@ case "${MODE}" in
       --weight-version "${WEIGHT_VERSION}" \
       --click-weight "${CLICK_WEIGHT}" \
       --cart-weight "${CART_WEIGHT}" \
-      --order-weight "${ORDER_WEIGHT}"
+      --order-weight "${ORDER_WEIGHT}" \
+      ${N_WORKERS:+--n-workers "${N_WORKERS}"} \
+      ${MAX_SHARDS:+--max-shards "${MAX_SHARDS}"}
     ;;
   submit)
     # 提交阶段读取测试 parquet，输出到 submit 专用目录。
@@ -107,10 +119,12 @@ case "${MODE}" in
       --weight-version "${WEIGHT_VERSION}" \
       --click-weight "${CLICK_WEIGHT}" \
       --cart-weight "${CART_WEIGHT}" \
-      --order-weight "${ORDER_WEIGHT}"
+      --order-weight "${ORDER_WEIGHT}" \
+      ${N_WORKERS:+--n-workers "${N_WORKERS}"} \
+      ${MAX_SHARDS:+--max-shards "${MAX_SHARDS}"}
     ;;
   *)
-    echo "Usage: $0 [train|submit] [--weight-version VERSION] [--click-weight N --cart-weight N --order-weight N]" >&2
+    echo "Usage: $0 [train|submit] [--weight-version VERSION] [--click-weight N --cart-weight N --order-weight N] [--n-workers N] [--max-shards N]" >&2
     exit 1
     ;;
 esac
