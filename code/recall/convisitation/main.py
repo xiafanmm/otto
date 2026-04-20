@@ -318,7 +318,7 @@ def write_metadata(
         "weight_version": weight_version,
         "weights": weights,
         "n_lookback": n_lookback,
-        "topk": topk,1
+        "topk": topk,
         "n_workers": n_workers,
         "n_shards": n_shards,
         "recent_threshold": recent_threshold,
