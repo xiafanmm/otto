@@ -5,7 +5,6 @@ import json
 import os
 import pickle
 import shutil
-from collections import defaultdict
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -260,45 +259,50 @@ def process_shard(parquet_path_str: str) -> str | None:
     if agg_df.empty:
         return None
 
-    shard_output = Path(WORK_TMP_DIR) / f"{parquet_path.stem}.pkl"
-    agg_df.to_pickle(shard_output)
+    # 落盘写 parquet 方便后续用 polars streaming 合并，不用 Python 逐行累加。
+    shard_output = Path(WORK_TMP_DIR) / f"{parquet_path.stem}.parquet"
+    pl.from_pandas(agg_df).write_parquet(shard_output)
     return str(shard_output)
 
 
-def merge_partial_counts(partial_files: list[Path]) -> dict[tuple[int, int], int]:
-    # 把各个 shard 的局部共现分数合并成全局 pair -> score 字典。
-    merged: dict[tuple[int, int], int] = defaultdict(int)
-    for partial_file in tqdm(partial_files, desc="merge partial counts"):
-        partial_df = pd.read_pickle(partial_file)
-        for aid_key, aid_future, score in partial_df.itertuples(index=False):
-            merged[(int(aid_key), int(aid_future))] += int(score)
-    return merged
+def merge_partial_counts(partial_files: list[Path]) -> pl.DataFrame:
+    # 所有 shard 的局部共现分数通过 polars streaming 聚合成全局 pair -> score 表。
+    # 相比 Python dict 逐行累加，Rust 多线程 streaming 对 8k 万+ 行的汇总快一个数量级。
+    return (
+        pl.scan_parquet([str(path) for path in partial_files])
+        .group_by(["aid_key", "aid_future"])
+        .agg(pl.col("score").sum().cast(pl.Int64))
+        .collect(streaming=True)
+    )
 
 
-def build_count_info_list(
-    merged_scores: dict[tuple[int, int], int],
-    topk: int,
-) -> list[Any]:
+def build_count_info_list(merged_scores: pl.DataFrame, topk: int) -> list[Any]:
     # 最终输出格式沿用原始比赛代码风格：
     # list[aid_key] = [候选 aid 列表, 对应 score 列表]
-    by_aid: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    max_aid = -1
-
-    for (aid_key, aid_future), score in merged_scores.items():
-        by_aid[aid_key].append((aid_future, score))
-        if aid_key > max_aid:
-            max_aid = aid_key
-
-    if max_aid < 0:
+    if merged_scores.is_empty():
         return []
 
+    # 先全局按 score 降序排一次，再 group_by + head(topk)。
+    # polars 的 group_by 在 agg 里会保留输入行顺序，所以 head(topk) 就是每组 top-k。
+    ranked = (
+        merged_scores.lazy()
+        .sort("score", descending=True)
+        .group_by("aid_key")
+        .agg(
+            pl.col("aid_future").head(topk),
+            pl.col("score").head(topk),
+        )
+        .collect()
+    )
+
+    max_aid = int(ranked["aid_key"].max())
     count_info_list: list[Any] = [-1] * (max_aid + 1)
-    for aid_key, candidates in tqdm(by_aid.items(), desc="build topk"):
-        candidates.sort(key=lambda item: item[1], reverse=True)
-        top_candidates = candidates[:topk]
-        count_info_list[aid_key] = [
-            [aid_future for aid_future, _ in top_candidates],
-            [score for _, score in top_candidates],
+    for aid_key, aid_future_list, score_list in tqdm(
+        ranked.iter_rows(), total=len(ranked), desc="build topk"
+    ):
+        count_info_list[int(aid_key)] = [
+            list(aid_future_list),
+            list(score_list),
         ]
     return count_info_list
 
