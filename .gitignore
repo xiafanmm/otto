@@ -12,3 +12,6 @@ wheels/
 
 # Project data
 data/
+
+# Local review notes (personal, not tracked)
+review/
