@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+# 训练总控：按 config 决定依次跑召回、融合和 ranker。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
@@ -15,6 +16,7 @@ ensure_dir "${EXP_LOG_DIR}"
 
 print_common_paths
 
+# 训练阶段顺序固定为：共现召回 -> NN 召回 -> 融合 -> 排序模型。
 if stage_enabled "${ENABLE_CONVISITATION}"; then
   run_shell_step "recall-convisitation" "code/recall/convisitation/run.sh" train
 else

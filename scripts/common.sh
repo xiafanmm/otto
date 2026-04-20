@@ -2,9 +2,11 @@
 
 set -euo pipefail
 
+# 公共脚本库：统一路径、实验配置解析和子步骤执行方式。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# 项目级目录约定，供所有训练/验证/提交脚本复用。
 DATA_DIR="${ROOT_DIR}/data"
 DOWNLOAD_DIR="${DATA_DIR}/downloads"
 RAW_DIR="${DATA_DIR}/raw"
@@ -22,10 +24,12 @@ if [[ ! -x "${PROJECT_PYTHON}" ]]; then
   PROJECT_PYTHON="${PROJECT_PYTHON_FALLBACK:-python}"
 fi
 
+# 保证目录存在，避免各阶段自行重复 mkdir。
 ensure_dir() {
   mkdir -p "$1"
 }
 
+# 把常见的 0/1、true/false 风格开关统一转成布尔判断。
 to_bool() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -41,6 +45,7 @@ stage_enabled() {
   to_bool "${1:-0}"
 }
 
+# 实验配置默认值：不传 config 时按 baseline 全流程运行。
 set_experiment_defaults() {
   EXP_NAME="${EXP_NAME:-baseline}"
   ENABLE_CONVISITATION="${ENABLE_CONVISITATION:-1}"
@@ -52,6 +57,7 @@ set_experiment_defaults() {
   CONFIG_PATH="${CONFIG_PATH:-}"
 }
 
+# 基于实验名派生本次运行的所有输出目录，保证实验之间互不覆盖。
 initialize_experiment_context() {
   set_experiment_defaults
 
@@ -64,6 +70,9 @@ initialize_experiment_context() {
   EXP_LOG_DIR="${LOG_DIR}/${EXP_NAME}"
   EXP_SUBMISSION_DIR="${SUBMISSIONS_DIR}/${EXP_NAME}"
   EXP_SUBMISSION_PATH="${EXP_SUBMISSION_DIR}/${SUBMISSION_NAME}"
+  EXP_RESULTS_DIR="${RESULTS_DIR}/${EXP_NAME}"
+  EXP_VALIDATION_PREDICTIONS_PATH="${EXP_RESULTS_DIR}/validation_predictions.csv"
+  EXP_VALIDATION_METRICS_PATH="${EXP_RESULTS_DIR}/validation_metrics.json"
   ABLATION_RESULTS_FILE="${RESULTS_DIR}/ablation.csv"
 
   export EXP_NAME
@@ -83,9 +92,13 @@ initialize_experiment_context() {
   export EXP_LOG_DIR
   export EXP_SUBMISSION_DIR
   export EXP_SUBMISSION_PATH
+  export EXP_RESULTS_DIR
+  export EXP_VALIDATION_PREDICTIONS_PATH
+  export EXP_VALIDATION_METRICS_PATH
   export ABLATION_RESULTS_FILE
 }
 
+# 读取命令行参数和 experiments/*.env，并初始化实验上下文。
 load_experiment_config() {
   local argv=("$@")
   local config_provided=0
@@ -146,6 +159,7 @@ load_experiment_config() {
   export RUN_ARGS
 }
 
+# 结果汇总写 CSV，先简单清理换行和逗号，避免破坏表结构。
 sanitize_csv_field() {
   local value="${1:-}"
   value="${value//$'\n'/ }"
@@ -153,6 +167,7 @@ sanitize_csv_field() {
   printf '%s' "${value}"
 }
 
+# 把 train / validation / submit 的运行结果记录到 ablation.csv。
 record_experiment_result() {
   local pipeline="$1"
   local status="$2"
@@ -181,6 +196,7 @@ EOF
     >> "${ABLATION_RESULTS_FILE}"
 }
 
+# 统一执行 Python 子步骤：自动补全项目根目录到 PYTHONPATH。
 run_python_step() {
   local step_name="$1"
   local script_path="$2"
@@ -201,6 +217,7 @@ run_python_step() {
   PYTHONPATH="${pythonpath}" "${PROJECT_PYTHON}" "${absolute_path}" "$@"
 }
 
+# 统一执行 shell 子步骤：缺文件时只提示 skip，方便渐进搭骨架。
 run_shell_step() {
   local step_name="$1"
   local script_path="$2"
@@ -216,6 +233,7 @@ run_shell_step() {
   bash "${absolute_path}" "$@"
 }
 
+# 打印关键路径和实验上下文，方便排查当前脚本到底在跑哪套实验。
 print_common_paths() {
   cat <<EOF
 ROOT_DIR=${ROOT_DIR}
@@ -233,6 +251,9 @@ EXP_PROCESSED_DIR=${EXP_PROCESSED_DIR:-}
 EXP_MODEL_DIR=${EXP_MODEL_DIR:-}
 EXP_LOG_DIR=${EXP_LOG_DIR:-}
 EXP_SUBMISSION_PATH=${EXP_SUBMISSION_PATH:-}
+EXP_RESULTS_DIR=${EXP_RESULTS_DIR:-}
+EXP_VALIDATION_PREDICTIONS_PATH=${EXP_VALIDATION_PREDICTIONS_PATH:-}
+EXP_VALIDATION_METRICS_PATH=${EXP_VALIDATION_METRICS_PATH:-}
 ENABLE_CONVISITATION=${ENABLE_CONVISITATION:-}
 ENABLE_NN=${ENABLE_NN:-}
 ENABLE_FUSION=${ENABLE_FUSION:-}

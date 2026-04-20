@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+# 数据准备脚本：优先解压本地已有 zip，没有再走 Kaggle 下载。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
@@ -10,6 +11,7 @@ VALIDATION_ARCHIVE="otto-validation.zip"
 PARQUET_DATASET="columbia2131/otto-chunk-data-inparquet-format"
 PARQUET_ARCHIVE="otto-chunk-data-inparquet-format.zip"
 
+# 检查外部命令是否可用，缺少时直接失败。
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
@@ -17,6 +19,7 @@ require_command() {
   fi
 }
 
+# 按统一目录规范解压数据，解压前会清空旧目录避免脏数据。
 extract_archive() {
   local archive_name="$1"
   local destination="$2"
@@ -33,6 +36,7 @@ extract_archive() {
   unzip -q "${DOWNLOAD_DIR}/${archive_name}" -d "${destination}"
 }
 
+# 仅负责下载 zip，不负责解压。
 download_dataset() {
   local dataset="$1"
   local archive_name="$2"
@@ -44,6 +48,7 @@ download_dataset() {
   kaggle datasets download -d "${dataset}" -p "${DOWNLOAD_DIR}"
 }
 
+# 主流程：准备目录 -> 按需下载 -> 解压到 validation / parquet_chunks。
 main() {
   require_command unzip
 
