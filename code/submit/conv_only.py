@@ -41,7 +41,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/Users/xiafan/Desktop/otto_self/data/processed"),
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for precomputed session-level parquet cache.",
+    )
     parser.add_argument("--topk", type=int, default=20)
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Rebuild cached session parquet files even if they already exist.",
+    )
     return parser.parse_args()
 
 
@@ -60,21 +71,9 @@ def load_count_info(path: Path) -> list[Any]:
         return pickle.load(fp)
 
 
-def get_recent_unique_aids(aids: list[int]) -> list[int]:
-    seen: set[int] = set()
-    recent_unique: list[int] = []
-    for aid in reversed(aids):
-        if aid in seen:
-            continue
-        seen.add(aid)
-        recent_unique.append(aid)
-    return recent_unique
-
-
 def predict_labels(
-    aids: list[int], count_info_list: list[Any], topk: int
+    recent_unique: list[int], count_info_list: list[Any], topk: int
 ) -> list[int]:
-    recent_unique = get_recent_unique_aids(aids)
     if not recent_unique:
         return []
 
@@ -106,11 +105,48 @@ def predict_labels(
     return labels
 
 
+def get_cache_path(cache_dir: Path, parquet_file: Path, topk: int) -> Path:
+    return cache_dir / f"{parquet_file.stem}.top{topk}.parquet"
+
+
+def prepare_session_cache_file(
+    parquet_file: Path, cache_path: Path, topk: int
+) -> None:
+    frame = (
+        pl.scan_parquet(parquet_file)
+        .select(["session", "aid", "ts"])
+        .group_by("session", maintain_order=True)
+        .agg(
+            pl.col("aid")
+            .sort_by("ts")
+            .reverse()
+            .unique(maintain_order=True)
+            .head(topk)
+            .alias("recent_aids")
+        )
+        .collect()
+    )
+    frame.write_parquet(cache_path)
+
+
+def prepare_session_cache(
+    parquet_files: list[Path], cache_dir: Path, topk: int, refresh_cache: bool
+) -> list[Path]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_files: list[Path] = []
+    for parquet_file in tqdm(parquet_files, desc="prepare cache"):
+        cache_path = get_cache_path(cache_dir, parquet_file, topk)
+        if refresh_cache or not cache_path.exists():
+            prepare_session_cache_file(parquet_file, cache_path, topk)
+        cache_files.append(cache_path)
+    return cache_files
+
+
 def write_version_submission(
     *,
     version: str,
     count_info_list: list[Any],
-    parquet_files: list[Path],
+    cache_files: list[Path],
     output_file: Path,
     topk: int,
 ) -> None:
@@ -118,16 +154,11 @@ def write_version_submission(
         writer = csv.writer(fp)
         writer.writerow(["session_type", "labels"])
 
-        for parquet_file in tqdm(parquet_files, desc=f"submit {version}"):
-            frame = (
-                pl.read_parquet(parquet_file, columns=["session", "aid", "ts"])
-                .sort(["session", "ts"])
-                .group_by("session", maintain_order=True)
-                .agg(pl.col("aid"))
-            )
+        for cache_file in tqdm(cache_files, desc=f"submit {version}"):
+            frame = pl.read_parquet(cache_file, columns=["session", "recent_aids"])
 
-            for session, aids in frame.iter_rows():
-                labels = predict_labels(list(aids), count_info_list, topk)
+            for session, recent_aids in frame.iter_rows():
+                labels = predict_labels(list(recent_aids), count_info_list, topk)
                 label_text = " ".join(str(aid) for aid in labels)
                 for event_type in EVENT_TYPES:
                     writer.writerow([f"{session}_{event_type}", label_text])
@@ -141,6 +172,14 @@ def main() -> None:
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under {args.test_dir}")
 
+    cache_dir = args.cache_dir or (args.output_dir / ".session_cache")
+    cache_files = prepare_session_cache(
+        parquet_files=parquet_files,
+        cache_dir=cache_dir,
+        topk=args.topk,
+        refresh_cache=args.refresh_cache,
+    )
+
     for version in args.versions:
         count_info_path = get_count_info_path(args.processed_root, version)
         if not count_info_path.exists():
@@ -151,7 +190,7 @@ def main() -> None:
         write_version_submission(
             version=version,
             count_info_list=count_info_list,
-            parquet_files=parquet_files,
+            cache_files=cache_files,
             output_file=output_file,
             topk=args.topk,
         )
