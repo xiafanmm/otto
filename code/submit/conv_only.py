@@ -11,6 +11,10 @@ from tqdm.auto import tqdm
 
 
 EVENT_TYPES = ("clicks", "carts", "orders")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TEST_DIR = PROJECT_ROOT / "data" / "raw" / "parquet_chunks" / "test_parquet"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "submissions" / "conv_only"
+DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,16 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-dir",
         type=Path,
-        default=Path(
-            "/Users/xiafan/Desktop/otto_self/data/raw/parquet_chunks/test_parquet"
-        ),
+        default=DEFAULT_TEST_DIR,
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(
-            "/Users/xiafan/Desktop/otto_self/data/submissions/conv_only"
-        ),
+        default=DEFAULT_OUTPUT_DIR,
     )
     parser.add_argument(
         "--versions",
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--processed-root",
         type=Path,
-        default=Path("/Users/xiafan/Desktop/otto_self/data/processed"),
+        default=DEFAULT_PROCESSED_ROOT,
     )
     parser.add_argument(
         "--cache-dir",
