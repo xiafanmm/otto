@@ -13,3 +13,5 @@ wheels/
 # Project data
 data/
 reviews/
+.claude/
+.vscode/
