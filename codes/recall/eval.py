@@ -23,12 +23,19 @@ TYPE_WEIGHTS = {"clicks": 0.10, "carts": 0.30, "orders": 0.60}
 class Args:
     exp_name: str
     k_list: list[int]
+    baseline: str | None
 
 
 def parse_args() -> Args:
     parser = argparse.ArgumentParser(description="Evaluate OTTO covisit recall.")
     parser.add_argument("--exp-name", required=True)
     parser.add_argument("--k-list", nargs="+", type=int, default=[20, 50, 100])
+    parser.add_argument(
+        "--baseline",
+        choices=["history"],
+        default=None,
+        help="若设为 history，则跳过 covisit，只用 session 历史 aid 当候选（用于 sanity check）",
+    )
     namespace = parser.parse_args()
 
     k_list = sorted(set(namespace.k_list))
@@ -69,25 +76,36 @@ def load_labels(logger) -> pl.LazyFrame:
 
 def build_top_candidates(
     events: pl.LazyFrame,
-    covisit: pl.LazyFrame,
+    covisit: pl.LazyFrame | None,
     max_k: int,
     logger,
+    baseline: str | None,
 ) -> pl.DataFrame:
     logger.info("building top-%d candidates per session", max_k)
 
-    history = events.unique(subset=["session", "aid"])
-    all_sessions = history.select("session").unique()
-
-    candidate_scores = (
-        history.join(covisit, left_on="aid", right_on="aid_a", how="inner")
-        .select("session", "aid_b", "score")
-        .group_by(["session", "aid_b"])
-        .agg(pl.col("score").sum().cast(pl.Float32).alias("score"))
-    )
-
-    top_candidates = candidate_scores.group_by("session").agg(
-        pl.col("aid_b").sort_by("score", descending=True).head(max_k).alias("cand_list")
-    )
+    if baseline == "history":
+        all_sessions = events.select("session").unique()
+        scored = events.group_by(["session", "aid"]).agg(
+            pl.len().cast(pl.Float32).alias("score")
+        )
+        top_candidates = scored.group_by("session").agg(
+            pl.col("aid").sort_by("score", descending=True).head(max_k).alias("cand_list")
+        )
+    else:
+        history = events.unique(subset=["session", "aid"])
+        all_sessions = history.select("session").unique()
+        candidate_scores = (
+            history.join(covisit, left_on="aid", right_on="aid_a", how="inner")
+            .select("session", "aid_b", "score")
+            .group_by(["session", "aid_b"])
+            .agg(pl.col("score").sum().cast(pl.Float32).alias("score"))
+        )
+        top_candidates = candidate_scores.group_by("session").agg(
+            pl.col("aid_b")
+            .sort_by("score", descending=True)
+            .head(max_k)
+            .alias("cand_list")
+        )
 
     top_candidates_df = (
         all_sessions.join(top_candidates, on="session", how="left")
@@ -142,16 +160,29 @@ def main():
     logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
     logger.info("*" * 150)
     logger.info("args: %s", args)
+    if args.baseline == "history":
+        logger.info("baseline mode: history (pure session-history, no covisit)")
+    else:
+        logger.info("baseline mode: None (pure covisit)")
     logger.info("load_test_data from: %s", TEST_DIR)
     logger.info("load_labels from: %s", LABELS_PATH)
     logger.info("=" * 150)
 
     max_k = max(args.k_list)
-    covisit = load_covisit(args.exp_name, logger)
+    if args.baseline == "history":
+        covisit = None
+    else:
+        covisit = load_covisit(args.exp_name, logger)
     events = load_test_events(logger)
     labels = load_labels(logger)
 
-    top_candidates = build_top_candidates(events, covisit, max_k=max_k, logger=logger)
+    top_candidates = build_top_candidates(
+        events,
+        covisit,
+        max_k=max_k,
+        logger=logger,
+        baseline=args.baseline,
+    )
 
     sessions_evaluated: dict[str, int] = {}
     recall_by_type: dict[str, dict[int, float]] = {}
@@ -196,6 +227,7 @@ def main():
 
     summary = {
         "exp_name": args.exp_name,
+        "baseline": args.baseline,
         "sessions_evaluated": sessions_evaluated,
         "recall_at": recall_at_output,
     }
