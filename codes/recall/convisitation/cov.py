@@ -71,7 +71,7 @@ def parse_args() -> Args:
     return Args(**vars(ns))
 
 
-def load_events(mode: str, days: int | None, logger) -> pl.LazyFrame:
+def load_events(mode: str, logger) -> pl.LazyFrame:
     """train 只用 train_parquet；submit 用 train+test 的全部事件。"""
     files = sorted(TRAIN_DIR.glob("*.parquet"))
     if mode == "submit":
@@ -85,13 +85,38 @@ def load_events(mode: str, days: int | None, logger) -> pl.LazyFrame:
         pl.col("type").cast(pl.Utf8),
     )
 
-    if days is not None:
-        max_ts = lf.select(pl.col("ts").max()).collect().item()
-        min_ts = max_ts - days * MS_PER_DAY
-        logger.info("filter ts >= %d (keep last %d days)", min_ts, days)
-        lf = lf.filter(pl.col("ts") >= min_ts)
-
     return lf
+
+
+def _pair_with_weight(
+    shifted: pl.LazyFrame,
+    *,
+    aid_a_col: str,
+    aid_b_col: str,
+    type_b_col: str,
+    ts_b_col: str,
+    type_weights: dict[str, int],
+    ts_range: tuple[int, int] | None,
+) -> pl.LazyFrame:
+    w_type = pl.col(type_b_col).replace_strict(
+        type_weights, default=0, return_dtype=pl.Int32
+    ).cast(pl.Float32)
+
+    if ts_range is None:
+        w_expr = w_type.alias("w")
+    else:
+        ts_min, ts_max = ts_range
+        span = max(ts_max - ts_min, 1)
+        time_scale = (
+            1.0 + TIME_DECAY_ALPHA * ((pl.col(ts_b_col) - ts_min) / span)
+        ).cast(pl.Float32)
+        w_expr = (w_type * time_scale).alias("w")
+
+    return shifted.select(
+        pl.col(aid_a_col).alias("aid_a"),
+        pl.col(aid_b_col).alias("aid_b"),
+        w_expr,
+    )
 
 
 def build_covisit(
@@ -112,7 +137,13 @@ def build_covisit(
 
     ts_range 非空时启用时间衰减：w = type_weight * (1 + α·(ts_b - ts_min)/(ts_max - ts_min))。
     """
-    base = events.sort(["session", "ts"]).select("session", "aid", "ts", "type")
+    logger.info("materializing sorted base events once")
+    base_df = (
+        events.sort(["session", "ts"])
+        .select("session", "aid", "ts", "type")
+        .collect(engine="streaming")
+    )
+    base = base_df.lazy()
 
     parts = []
     for i in range(1, n_lookback + 1):
@@ -128,44 +159,38 @@ def build_covisit(
             & ((pl.col("ts") - pl.col("ts_prev")).abs() <= window_ms)
             & (pl.col("aid") != pl.col("aid_prev"))
         )
-        forward = shifted.select(
-            pl.col("aid_prev").alias("aid_a"),
-            pl.col("aid").alias("aid_b"),
-            pl.col("type").alias("type_b"),
-            pl.col("ts").alias("ts_b"),
+        forward = _pair_with_weight(
+            shifted,
+            aid_a_col="aid_prev",
+            aid_b_col="aid",
+            type_b_col="type",
+            ts_b_col="ts",
+            type_weights=type_weights,
+            ts_range=ts_range,
         )
-        backward = shifted.select(
-            pl.col("aid").alias("aid_a"),
-            pl.col("aid_prev").alias("aid_b"),
-            pl.col("type_prev").alias("type_b"),
-            pl.col("ts_prev").alias("ts_b"),
+        backward = _pair_with_weight(
+            shifted,
+            aid_a_col="aid",
+            aid_b_col="aid_prev",
+            type_b_col="type_prev",
+            ts_b_col="ts_prev",
+            type_weights=type_weights,
+            ts_range=ts_range,
         )
         parts.append(forward)
         parts.append(backward)
 
-    w_type = pl.col("type_b").replace_strict(
-        type_weights, default=0, return_dtype=pl.Int32
-    )
-    if ts_range is None:
-        w_expr = w_type.alias("w")
-    else:
-        ts_min, ts_max = ts_range
-        span = max(ts_max - ts_min, 1)
-        w_expr = (
-            w_type.cast(pl.Float32)
-            * (1.0 + TIME_DECAY_ALPHA * (pl.col("ts_b") - ts_min) / span).cast(
-                pl.Float32
-            )
-        ).alias("w")
-
-    pairs = pl.concat(parts).with_columns(w_expr)
+    pairs = pl.concat(parts)
 
     scores = (
         pairs.group_by(["aid_a", "aid_b"])
-        .agg(pl.col("w").sum().alias("score"))
-        .sort(["aid_a", "score"], descending=[False, True])
-        .group_by("aid_a", maintain_order=True)
-        .head(topk)
+        .agg(pl.col("w").sum().cast(pl.Float32).alias("score"))
+        .group_by("aid_a")
+        .agg(
+            pl.col("aid_b").sort_by("score", descending=True).head(topk),
+            pl.col("score").sort_by("score", descending=True).head(topk),
+        )
+        .explode(["aid_b", "score"])
     )
 
     logger.info("collecting co-visit pairs (shift, n_lookback=%d)", n_lookback)
@@ -178,23 +203,37 @@ def main():
     args = parse_args()
     logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
     logger.info("args: %s", args)
+    logger.info("load_train_data from: %s", TRAIN_DIR)
+    logger.info("load_test_data from: %s", TEST_DIR)
     logger.info("=" * 100)
 
     type_weights = {"clicks": args.click, "carts": args.cart, "orders": args.order}
     window_ms = args.hours * MS_PER_HOUR
 
-    events = load_events(args.mode, args.days, logger)
+    events = load_events(args.mode, logger)
 
     ts_range = None
-    if args.time_decay:
+    if args.days is not None or args.time_decay:
         ts_stats = events.select(
             pl.col("ts").min().alias("lo"), pl.col("ts").max().alias("hi")
         ).collect()
-        ts_range = (int(ts_stats["lo"][0]), int(ts_stats["hi"][0]))
-        logger.info(
-            "time decay ON: ts_min=%d ts_max=%d alpha=%.1f",
-            ts_range[0], ts_range[1], TIME_DECAY_ALPHA,
-        )
+        ts_min_all = int(ts_stats["lo"][0])
+        ts_max = int(ts_stats["hi"][0])
+
+        ts_min = ts_min_all
+        if args.days is not None:
+            ts_min = ts_max - args.days * MS_PER_DAY
+            logger.info("filter ts >= %d (keep last %d days)", ts_min, args.days)
+            events = events.filter(pl.col("ts") >= ts_min)
+
+        if args.time_decay:
+            ts_range = (ts_min, ts_max)
+            logger.info(
+                "time decay ON: ts_min=%d ts_max=%d alpha=%.1f",
+                ts_range[0], ts_range[1], TIME_DECAY_ALPHA,
+            )
+        else:
+            logger.info("time decay OFF")
     else:
         logger.info("time decay OFF")
 
