@@ -2,7 +2,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s | %(message)s"
+DEFAULT_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-22s | %(filename)-12s | %(message)s"
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 ROOT = Path(__file__).resolve().parents[2]
 

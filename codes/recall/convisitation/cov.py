@@ -202,10 +202,11 @@ def build_covisit(
 def main():
     args = parse_args()
     logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
+    logger.info("*" * 150)
     logger.info("args: %s", args)
     logger.info("load_train_data from: %s", TRAIN_DIR)
     logger.info("load_test_data from: %s", TEST_DIR)
-    logger.info("=" * 100)
+    logger.info("=" * 150)
 
     type_weights = {"clicks": args.click, "carts": args.cart, "orders": args.order}
     window_ms = args.hours * MS_PER_HOUR
