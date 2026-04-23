@@ -161,6 +161,11 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
         raise FileNotFoundError("train/test parquet files are required")
 
     stats = (
+        # h_min_sec = 如果 ts 是秒，最小小时编号
+        # h_max_sec = 如果 ts 是秒，最大小时编号
+
+        # h_min_ms = 如果 ts 是毫秒，最小小时编号
+        # h_max_ms = 如果 ts 是毫秒，最大小时编号
         event_scan(all_files)
         .select(
             pl.col("aid").max().alias("aid_max"),
@@ -168,12 +173,8 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
             pl.col("ts").max().alias("ts_max"),
             (pl.col("ts") // SECONDS_PER_HOUR).min().alias("h_min_sec"),
             (pl.col("ts") // SECONDS_PER_HOUR).max().alias("h_max_sec"),
-            (pl.col("ts") // (SECONDS_PER_HOUR * MILLISECONDS_PER_SECOND))
-            .min()
-            .alias("h_min_ms"),
-            (pl.col("ts") // (SECONDS_PER_HOUR * MILLISECONDS_PER_SECOND))
-            .max()
-            .alias("h_max_ms"),
+            (pl.col("ts") // (SECONDS_PER_HOUR * MILLISECONDS_PER_SECOND)).min().alias("h_min_ms"),
+            (pl.col("ts") // (SECONDS_PER_HOUR * MILLISECONDS_PER_SECOND)).max().alias("h_max_ms"),
         )
         .collect(engine="streaming")
         .row(0, named=True)

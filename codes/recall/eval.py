@@ -14,6 +14,7 @@ from utils.logger import setup_logger  # noqa: E402
 
 COVISIT_DIR = ROOT / "data/recall/covisit"
 NN_DIR = ROOT / "data/recall/nn"
+FUSED_DIR = ROOT / "data/recall/fused"
 TEST_DIR = ROOT / "data/raw/validation/test_parquet"
 LABELS_PATH = ROOT / "data/raw/validation/test_labels.parquet"
 EVAL_ROOT = ROOT / "data/eval"
@@ -33,7 +34,7 @@ def parse_args() -> Args:
     parser.add_argument("--k-list", nargs="+", type=int, default=[20, 50, 100])
     parser.add_argument(
         "--method",
-        choices=["covisit", "history", "nn"],
+        choices=["covisit", "history", "nn", "fused"],
         default="covisit",
         help="recall source to evaluate",
     )
@@ -60,26 +61,28 @@ def load_covisit(exp_name: str, logger) -> pl.LazyFrame:
     )
 
 
-def load_nn_candidates(exp_name: str, max_k: int, logger) -> pl.DataFrame:
-    nn_path = NN_DIR / exp_name / "train.parquet"
-    if not nn_path.exists():
-        raise FileNotFoundError(f"nn recall parquet not found: {nn_path}")
+def load_typed_candidates(
+    path: Path,
+    *,
+    max_k: int,
+    logger,
+    label: str,
+) -> pl.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} recall parquet not found: {path}")
 
-    schema = pl.scan_parquet(str(nn_path)).collect_schema()
+    schema = pl.scan_parquet(str(path)).collect_schema()
     missing = {"type", "session", "candidates"} - set(schema.names())
     if missing:
-        raise ValueError(f"nn recall parquet missing columns: {sorted(missing)}")
+        raise ValueError(f"{label} recall parquet missing columns: {sorted(missing)}")
 
-    logger.info("load nn recall from: %s", nn_path)
+    logger.info("load %s recall from: %s", label, path)
     candidates = (
-        pl.scan_parquet(str(nn_path))
+        pl.scan_parquet(str(path))
         .select(
             pl.col("type").cast(pl.Utf8),
             pl.col("session").cast(pl.Int32),
-            pl.col("candidates")
-            .cast(pl.List(pl.Int32))
-            .list.head(max_k)
-            .alias("cand_list"),
+            pl.col("candidates").list.head(max_k).alias("cand_list"),
         )
         .collect(engine="streaming")
     )
@@ -89,6 +92,24 @@ def load_nn_candidates(exp_name: str, max_k: int, logger) -> pl.DataFrame:
         candidates["session"].n_unique(),
     )
     return candidates
+
+
+def load_nn_candidates(exp_name: str, max_k: int, logger) -> pl.DataFrame:
+    return load_typed_candidates(
+        NN_DIR / exp_name / "train.parquet",
+        max_k=max_k,
+        logger=logger,
+        label="nn",
+    )
+
+
+def load_fused_candidates(exp_name: str, max_k: int, logger) -> pl.DataFrame:
+    return load_typed_candidates(
+        FUSED_DIR / exp_name / "train_topk.parquet",
+        max_k=max_k,
+        logger=logger,
+        label="fused",
+    )
 
 
 def load_test_events(logger) -> pl.LazyFrame:
@@ -218,6 +239,8 @@ def main():
     max_k = max(args.k_list)
     if args.method == "nn":
         top_candidates = load_nn_candidates(args.exp_name, max_k, logger)
+    elif args.method == "fused":
+        top_candidates = load_fused_candidates(args.exp_name, max_k, logger)
     else:
         covisit = None if args.method == "history" else load_covisit(args.exp_name, logger)
         events = load_test_events(logger)
