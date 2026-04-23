@@ -99,38 +99,27 @@ def build_nn_scores(args: Args, logger) -> pl.LazyFrame:
         raise ValueError(f"nn recall parquet missing columns: {sorted(missing)}")
 
     logger.info("load nn recall from: %s", nn_path)
-    nn_long = (
-        pl.scan_parquet(str(nn_path))
-        .select(
-            pl.col("type").cast(pl.Utf8),
-            pl.col("session").cast(pl.Int32),
-            pl.col("candidates").cast(pl.List(pl.Int32)),
-            pl.col("scores").cast(pl.List(pl.Float32)),
-        )
-        .explode(["candidates", "scores"])
-        .select(
-            "session",
-            "type",
-            pl.col("candidates").alias("aid"),
-            pl.col("scores").alias("nn_score").cast(pl.Float32),
-        )
+    base = pl.scan_parquet(str(nn_path)).select(
+        pl.col("type").cast(pl.Utf8),
+        pl.col("session").cast(pl.Int32),
+        pl.col("candidates"),
+        pl.col("scores"),
     )
-    return nn_long.group_by(["session", "aid"]).agg(
-        pl.col("nn_score")
-        .filter(pl.col("type") == "clicks")
-        .max()
-        .cast(pl.Float32)
-        .alias("nn_clicks_score"),
-        pl.col("nn_score")
-        .filter(pl.col("type") == "carts")
-        .max()
-        .cast(pl.Float32)
-        .alias("nn_carts_score"),
-        pl.col("nn_score")
-        .filter(pl.col("type") == "orders")
-        .max()
-        .cast(pl.Float32)
-        .alias("nn_orders_score"),
+    parts = []
+    for event_type, out_col in TYPE_TO_NN_COL.items():
+        parts.append(
+            base.filter(pl.col("type") == event_type)
+            .explode(["candidates", "scores"])
+            .select(
+                pl.col("session").cast(pl.Int32),
+                pl.col("candidates").cast(pl.Int32).alias("aid"),
+                pl.col("scores").cast(pl.Float32).alias(out_col),
+            )
+        )
+    return pl.concat(parts, how="diagonal_relaxed").group_by(["session", "aid"]).agg(
+        pl.col("nn_clicks_score").max().cast(pl.Float32).alias("nn_clicks_score"),
+        pl.col("nn_carts_score").max().cast(pl.Float32).alias("nn_carts_score"),
+        pl.col("nn_orders_score").max().cast(pl.Float32).alias("nn_orders_score"),
     )
 
 
@@ -152,34 +141,56 @@ def build_wide_scores(
     nn_scores: pl.LazyFrame,
     history_scores: pl.LazyFrame,
     logger,
-) -> pl.DataFrame:
-    logger.info("joining covisit, nn, history scores into wide table")
-    wide = (
-        covisit_scores.join(
-            nn_scores,
-            on=["session", "aid"],
-            how="full",
-            coalesce=True,
+) -> pl.LazyFrame:
+    logger.info("building wide scores via concat + group_by")
+    return (
+        pl.concat(
+            [
+                covisit_scores.select(
+                    "session",
+                    "aid",
+                    pl.col("covisit_score").cast(pl.Float32),
+                ),
+                nn_scores.select(
+                    "session",
+                    "aid",
+                    pl.col("nn_clicks_score").cast(pl.Float32),
+                    pl.col("nn_carts_score").cast(pl.Float32),
+                    pl.col("nn_orders_score").cast(pl.Float32),
+                ),
+                history_scores.select(
+                    "session",
+                    "aid",
+                    pl.col("history_score").cast(pl.Float32),
+                ),
+            ],
+            how="diagonal_relaxed",
         )
-        .join(
-            history_scores,
-            on=["session", "aid"],
-            how="full",
-            coalesce=True,
+        .group_by(["session", "aid"])
+        .agg(
+            pl.col("covisit_score").max().alias("covisit_score"),
+            pl.col("nn_clicks_score").max().alias("nn_clicks_score"),
+            pl.col("nn_carts_score").max().alias("nn_carts_score"),
+            pl.col("nn_orders_score").max().alias("nn_orders_score"),
+            pl.col("history_score").max().alias("history_score"),
         )
-        .select(
-            pl.col("session").cast(pl.Int32),
-            pl.col("aid").cast(pl.Int32),
+        .with_columns(
             pl.col("covisit_score").fill_null(0.0).cast(pl.Float32),
             pl.col("nn_clicks_score").fill_null(0.0).cast(pl.Float32),
             pl.col("nn_carts_score").fill_null(0.0).cast(pl.Float32),
             pl.col("nn_orders_score").fill_null(0.0).cast(pl.Float32),
             pl.col("history_score").fill_null(0.0).cast(pl.Float32),
         )
+        .select(
+            pl.col("session").cast(pl.Int32),
+            pl.col("aid").cast(pl.Int32),
+            pl.col("covisit_score").cast(pl.Float32),
+            pl.col("nn_clicks_score").cast(pl.Float32),
+            pl.col("nn_carts_score").cast(pl.Float32),
+            pl.col("nn_orders_score").cast(pl.Float32),
+            pl.col("history_score").cast(pl.Float32),
+        )
     )
-    wide_df = wide.collect(engine="streaming")
-    logger.info("wide rows=%d, unique sessions=%d", wide_df.height, wide_df["session"].n_unique())
-    return wide_df
 
 
 def rank_score_expr(score_col: str, alias: str) -> pl.Expr:
@@ -201,68 +212,72 @@ def rank_score_expr(score_col: str, alias: str) -> pl.Expr:
     )
 
 
-def build_type_topk(
-    wide_scores: pl.LazyFrame,
-    *,
-    event_type: str,
-    nn_col: str,
-    args: Args,
-) -> pl.LazyFrame:
-    return (
-        wide_scores.select(
-            pl.lit(event_type).alias("type"),
-            "session",
-            "aid",
-            "covisit_score",
-            pl.col(nn_col).alias("nn_score"),
-            "history_score",
-        )
-        .with_columns(
-            rank_score_expr("covisit_score", "covisit_rank"),
-            rank_score_expr("nn_score", "nn_rank"),
-            rank_score_expr("history_score", "history_rank"),
-        )
-        .with_columns(
-            (
-                pl.lit(args.alpha).cast(pl.Float32) * pl.col("covisit_rank")
-                + pl.lit(args.beta).cast(pl.Float32) * pl.col("nn_rank")
-                + pl.lit(args.gamma).cast(pl.Float32) * pl.col("history_rank")
-            )
-            .cast(pl.Float32)
-            .alias("fused_score")
-        )
-        .filter(pl.col("fused_score") > 0)
-        .group_by(["type", "session"])
-        .agg(
-            pl.col("aid")
-            .sort_by("fused_score", descending=True)
-            .head(args.topk)
-            .alias("candidates"),
-            pl.col("fused_score")
-            .sort_by("fused_score", descending=True)
-            .head(args.topk)
-            .alias("scores"),
-        )
-        .select("type", "session", "candidates", "scores")
-    )
-
-
 def build_topk_table(wide_path: Path, args: Args, logger) -> pl.DataFrame:
     logger.info("building fused top-%d candidates per type", args.topk)
-    wide_scores = pl.scan_parquet(str(wide_path)).select(
-        pl.col("session").cast(pl.Int32),
-        pl.col("aid").cast(pl.Int32),
-        pl.col("covisit_score").cast(pl.Float32),
-        pl.col("nn_clicks_score").cast(pl.Float32),
-        pl.col("nn_carts_score").cast(pl.Float32),
-        pl.col("nn_orders_score").cast(pl.Float32),
-        pl.col("history_score").cast(pl.Float32),
+    alpha = pl.lit(args.alpha).cast(pl.Float32)
+    beta = pl.lit(args.beta).cast(pl.Float32)
+    gamma = pl.lit(args.gamma).cast(pl.Float32)
+    ranked = pl.scan_parquet(str(wide_path)).with_columns(
+        rank_score_expr("covisit_score", "covisit_rank"),
+        rank_score_expr("history_score", "history_rank"),
+        rank_score_expr("nn_clicks_score", "nn_clicks_rank"),
+        rank_score_expr("nn_carts_score", "nn_carts_rank"),
+        rank_score_expr("nn_orders_score", "nn_orders_rank"),
+    ).with_columns(
+        (
+            alpha * pl.col("covisit_rank")
+            + beta * pl.col("nn_clicks_rank")
+            + gamma * pl.col("history_rank")
+        )
+        .cast(pl.Float32)
+        .alias("fused_clicks_score"),
+        (
+            alpha * pl.col("covisit_rank")
+            + beta * pl.col("nn_carts_rank")
+            + gamma * pl.col("history_rank")
+        )
+        .cast(pl.Float32)
+        .alias("fused_carts_score"),
+        (
+            alpha * pl.col("covisit_rank")
+            + beta * pl.col("nn_orders_rank")
+            + gamma * pl.col("history_rank")
+        )
+        .cast(pl.Float32)
+        .alias("fused_orders_score"),
     )
-    topk = pl.concat(
-        [
-            build_type_topk(wide_scores, event_type=event_type, nn_col=nn_col, args=args)
-            for event_type, nn_col in TYPE_TO_NN_COL.items()
-        ]
+    long = (
+        ranked.unpivot(
+            index=["session", "aid"],
+            on=["fused_clicks_score", "fused_carts_score", "fused_orders_score"],
+            variable_name="type_col",
+            value_name="fused_score",
+        )
+        .with_columns(
+            pl.col("type_col")
+            .replace_strict(
+                {
+                    "fused_clicks_score": "clicks",
+                    "fused_carts_score": "carts",
+                    "fused_orders_score": "orders",
+                },
+                return_dtype=pl.Utf8,
+            )
+            .alias("type")
+        )
+        .filter(pl.col("fused_score") > 0)
+    )
+    topk = (
+        long.group_by(["type", "session"])
+        .agg(pl.struct("aid", "fused_score").top_k_by("fused_score", args.topk).alias("pairs"))
+        .explode("pairs")
+        .unnest("pairs")
+        .group_by(["type", "session"], maintain_order=True)
+        .agg(
+            pl.col("aid").cast(pl.Int32).alias("candidates"),
+            pl.col("fused_score").cast(pl.Float32).alias("scores"),
+        )
+        .select("type", "session", "candidates", "scores")
     ).collect(engine="streaming")
     logger.info("topk rows=%d, unique sessions=%d", topk.height, topk["session"].n_unique())
     return topk
@@ -270,7 +285,7 @@ def build_topk_table(wide_path: Path, args: Args, logger) -> pl.DataFrame:
 
 def main():
     args = parse_args()
-    logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
+    logger = setup_logger(args.exp_name, stage="fused", run_name=SCRIPT_NAME)
     logger.info("*" * 150)
     logger.info("args: %s", args)
     logger.info("load_test_data from: %s", TEST_DIR)
@@ -287,8 +302,8 @@ def main():
     wide_path = out_dir / f"{args.mode}.parquet"
     topk_path = out_dir / f"{args.mode}_topk.parquet"
 
-    wide_df = build_wide_scores(covisit_scores, nn_scores, history_scores, logger)
-    wide_df.write_parquet(wide_path)
+    wide_lf = build_wide_scores(covisit_scores, nn_scores, history_scores, logger)
+    wide_lf.sink_parquet(str(wide_path))
     logger.info("saved fused wide parquet to %s", wide_path)
 
     topk_df = build_topk_table(wide_path, args, logger)

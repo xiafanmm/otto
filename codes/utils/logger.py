@@ -25,8 +25,9 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def setup_logger(
-    exp_name: str, 
+    exp_name: str,
     *,
+    stage: str,
     log_dir: str | Path | None = None,
     run_name: str | None = None,
     level: int | str = logging.INFO,
@@ -35,7 +36,7 @@ def setup_logger(
     """Create a console+file logger for a pipeline stage.
 
     Example:
-        logger = setup_logger("fusion", log_dir=LOG_DIR / "fusion", run_name="train")
+        logger = setup_logger("fusion", stage="fused", run_name="train")
         logger.info("starting fusion stage")
     """
 
@@ -53,7 +54,7 @@ def setup_logger(
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
-    target_dir = ensure_dir(log_dir or (LOG_DIR / exp_name))
+    target_dir = ensure_dir(log_dir or (LOG_DIR / stage / exp_name))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_stem = f"{run_name}_{timestamp}" if run_name else timestamp
     log_path = target_dir / f"{log_stem}.log"

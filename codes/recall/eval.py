@@ -228,7 +228,11 @@ def round4(value: float) -> float:
 
 def main():
     args = parse_args()
-    logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
+    logger = setup_logger(
+        args.exp_name,
+        stage=f"eval/{args.method}",
+        run_name=SCRIPT_NAME,
+    )
     logger.info("*" * 150)
     logger.info("args: %s", args)
     logger.info("method: %s", args.method)
