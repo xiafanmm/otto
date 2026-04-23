@@ -183,6 +183,7 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
     aid_max = int(stats["aid_max"])
     ts_min = int(stats["ts_min"])
     ts_max = int(stats["ts_max"])
+    # ts_scale 是一个单位缩放因子，用 ts_max 的位数来猜 ts 是秒还是毫秒。
     ts_scale = MILLISECONDS_PER_SECOND if ts_max >= 10**12 else 1
     ts_per_hour = SECONDS_PER_HOUR * ts_scale
     ts_per_day = SECONDS_PER_DAY * ts_scale

@@ -193,20 +193,11 @@ def build_wide_scores(
     )
 
 
-def rank_score_expr(score_col: str, alias: str) -> pl.Expr:
-    positive_count = (
-        pl.when(pl.col(score_col) > 0)
-        .then(pl.lit(1.0))
-        .otherwise(pl.lit(0.0))
-        .sum()
-        .over("session")
-        .cast(pl.Float32)
-    )
-    denom = pl.max_horizontal(positive_count, pl.lit(1.0).cast(pl.Float32))
-    rank = pl.col(score_col).rank("ordinal", descending=True).over("session").cast(pl.Float32)
+def minmax_score_expr(score_col: str, alias: str) -> pl.Expr:
+    max_val = pl.col(score_col).max().over("session").cast(pl.Float32)
     return (
-        pl.when(pl.col(score_col) > 0)
-        .then((pl.lit(1.0) - (rank - 1.0) / denom).cast(pl.Float32))
+        pl.when((pl.col(score_col) > 0) & (max_val > 0))
+        .then((pl.col(score_col) / max_val).cast(pl.Float32))
         .otherwise(pl.lit(0.0).cast(pl.Float32))
         .alias(alias)
     )
@@ -217,68 +208,65 @@ def build_topk_table(wide_path: Path, args: Args, logger) -> pl.DataFrame:
     alpha = pl.lit(args.alpha).cast(pl.Float32)
     beta = pl.lit(args.beta).cast(pl.Float32)
     gamma = pl.lit(args.gamma).cast(pl.Float32)
-    ranked = pl.scan_parquet(str(wide_path)).with_columns(
-        rank_score_expr("covisit_score", "covisit_rank"),
-        rank_score_expr("history_score", "history_rank"),
-        rank_score_expr("nn_clicks_score", "nn_clicks_rank"),
-        rank_score_expr("nn_carts_score", "nn_carts_rank"),
-        rank_score_expr("nn_orders_score", "nn_orders_rank"),
-    ).with_columns(
-        (
-            alpha * pl.col("covisit_rank")
-            + beta * pl.col("nn_clicks_rank")
-            + gamma * pl.col("history_rank")
-        )
-        .cast(pl.Float32)
-        .alias("fused_clicks_score"),
-        (
-            alpha * pl.col("covisit_rank")
-            + beta * pl.col("nn_carts_rank")
-            + gamma * pl.col("history_rank")
-        )
-        .cast(pl.Float32)
-        .alias("fused_carts_score"),
-        (
-            alpha * pl.col("covisit_rank")
-            + beta * pl.col("nn_orders_rank")
-            + gamma * pl.col("history_rank")
-        )
-        .cast(pl.Float32)
-        .alias("fused_orders_score"),
-    )
-    long = (
-        ranked.unpivot(
-            index=["session", "aid"],
-            on=["fused_clicks_score", "fused_carts_score", "fused_orders_score"],
-            variable_name="type_col",
-            value_name="fused_score",
-        )
-        .with_columns(
-            pl.col("type_col")
-            .replace_strict(
-                {
-                    "fused_clicks_score": "clicks",
-                    "fused_carts_score": "carts",
-                    "fused_orders_score": "orders",
-                },
-                return_dtype=pl.Utf8,
+    tmp_dir = wide_path.parent
+    tmp_paths: list[Path] = []
+
+    try:
+        for event_type, nn_col in TYPE_TO_NN_COL.items():
+            logger.info("processing type=%s", event_type)
+            tmp_path = tmp_dir / f"_topk_{event_type}.tmp.parquet"
+            per_type = (
+                pl.scan_parquet(str(wide_path))
+                .select(
+                    pl.lit(event_type, dtype=pl.Utf8).alias("type"),
+                    pl.col("session").cast(pl.Int32),
+                    pl.col("aid").cast(pl.Int32),
+                    pl.col("covisit_score").cast(pl.Float32),
+                    pl.col(nn_col).cast(pl.Float32).alias("nn_score"),
+                    pl.col("history_score").cast(pl.Float32),
+                )
+                .with_columns(
+                    minmax_score_expr("covisit_score", "covisit_rank"),
+                    minmax_score_expr("nn_score", "nn_rank"),
+                    minmax_score_expr("history_score", "history_rank"),
+                )
+                .with_columns(
+                    (
+                        alpha * pl.col("covisit_rank")
+                        + beta * pl.col("nn_rank")
+                        + gamma * pl.col("history_rank")
+                    )
+                    .cast(pl.Float32)
+                    .alias("fused_score")
+                )
+                .filter(pl.col("fused_score") > 0)
+                .group_by(["type", "session"])
+                .agg(
+                    pl.struct("aid", "fused_score")
+                    .top_k_by("fused_score", args.topk)
+                    .alias("pairs")
+                )
+                .explode("pairs")
+                .unnest("pairs")
+                .group_by(["type", "session"], maintain_order=True)
+                .agg(
+                    pl.col("aid").cast(pl.Int32).alias("candidates"),
+                    pl.col("fused_score").cast(pl.Float32).alias("scores"),
+                )
+                .select("type", "session", "candidates", "scores")
             )
-            .alias("type")
-        )
-        .filter(pl.col("fused_score") > 0)
-    )
-    topk = (
-        long.group_by(["type", "session"])
-        .agg(pl.struct("aid", "fused_score").top_k_by("fused_score", args.topk).alias("pairs"))
-        .explode("pairs")
-        .unnest("pairs")
-        .group_by(["type", "session"], maintain_order=True)
-        .agg(
-            pl.col("aid").cast(pl.Int32).alias("candidates"),
-            pl.col("fused_score").cast(pl.Float32).alias("scores"),
-        )
-        .select("type", "session", "candidates", "scores")
-    ).collect(engine="streaming")
+            per_type.sink_parquet(str(tmp_path))
+            tmp_paths.append(tmp_path)
+
+        logger.info("concatenating %d per-type topk files", len(tmp_paths))
+        topk = pl.concat(
+            [pl.scan_parquet(str(path)) for path in tmp_paths],
+            how="vertical",
+        ).collect(engine="streaming")
+    finally:
+        for path in tmp_paths:
+            path.unlink(missing_ok=True)
+
     logger.info("topk rows=%d, unique sessions=%d", topk.height, topk["session"].n_unique())
     return topk
 
