@@ -12,10 +12,11 @@ sys.path.insert(0, str(ROOT / "codes"))
 
 from utils.logger import setup_logger  # noqa: E402
 
-RECALL_DIR = ROOT / "data/recall/covisit"
+COVISIT_DIR = ROOT / "data/recall/covisit"
+NN_DIR = ROOT / "data/recall/nn"
 TEST_DIR = ROOT / "data/raw/validation/test_parquet"
 LABELS_PATH = ROOT / "data/raw/validation/test_labels.parquet"
-EVAL_OUT_DIR = ROOT / "data/eval/covisit"
+EVAL_ROOT = ROOT / "data/eval"
 TYPE_WEIGHTS = {"clicks": 0.10, "carts": 0.30, "orders": 0.60}
 
 
@@ -23,18 +24,18 @@ TYPE_WEIGHTS = {"clicks": 0.10, "carts": 0.30, "orders": 0.60}
 class Args:
     exp_name: str
     k_list: list[int]
-    baseline: str | None
+    method: str
 
 
 def parse_args() -> Args:
-    parser = argparse.ArgumentParser(description="Evaluate OTTO covisit recall.")
+    parser = argparse.ArgumentParser(description="Evaluate OTTO recall.")
     parser.add_argument("--exp-name", required=True)
     parser.add_argument("--k-list", nargs="+", type=int, default=[20, 50, 100])
     parser.add_argument(
-        "--baseline",
-        choices=["history"],
-        default=None,
-        help="若设为 history，则跳过 covisit，只用 session 历史 aid 当候选（用于 sanity check）",
+        "--method",
+        choices=["covisit", "history", "nn"],
+        default="covisit",
+        help="recall source to evaluate",
     )
     namespace = parser.parse_args()
 
@@ -47,7 +48,7 @@ def parse_args() -> Args:
 
 
 def load_covisit(exp_name: str, logger) -> pl.LazyFrame:
-    covisit_path = RECALL_DIR / exp_name / "train.parquet"
+    covisit_path = COVISIT_DIR / exp_name / "train.parquet"
     if not covisit_path.exists():
         raise FileNotFoundError(f"covisit parquet not found: {covisit_path}")
 
@@ -57,6 +58,37 @@ def load_covisit(exp_name: str, logger) -> pl.LazyFrame:
         pl.col("aid_b").cast(pl.Int32),
         pl.col("score").cast(pl.Float32),
     )
+
+
+def load_nn_candidates(exp_name: str, max_k: int, logger) -> pl.DataFrame:
+    nn_path = NN_DIR / exp_name / "train.parquet"
+    if not nn_path.exists():
+        raise FileNotFoundError(f"nn recall parquet not found: {nn_path}")
+
+    schema = pl.scan_parquet(str(nn_path)).collect_schema()
+    missing = {"type", "session", "candidates"} - set(schema.names())
+    if missing:
+        raise ValueError(f"nn recall parquet missing columns: {sorted(missing)}")
+
+    logger.info("load nn recall from: %s", nn_path)
+    candidates = (
+        pl.scan_parquet(str(nn_path))
+        .select(
+            pl.col("type").cast(pl.Utf8),
+            pl.col("session").cast(pl.Int32),
+            pl.col("candidates")
+            .cast(pl.List(pl.Int32))
+            .list.head(max_k)
+            .alias("cand_list"),
+        )
+        .collect(engine="streaming")
+    )
+    logger.info(
+        "candidate rows=%d, unique sessions=%d",
+        candidates.height,
+        candidates["session"].n_unique(),
+    )
+    return candidates
 
 
 def load_test_events(logger) -> pl.LazyFrame:
@@ -79,11 +111,11 @@ def build_top_candidates(
     covisit: pl.LazyFrame | None,
     max_k: int,
     logger,
-    baseline: str | None,
+    method: str,
 ) -> pl.DataFrame:
     logger.info("building top-%d candidates per session", max_k)
 
-    if baseline == "history":
+    if method == "history":
         all_sessions = events.select("session").unique()
         scored = events.group_by(["session", "aid"]).agg(
             pl.len().cast(pl.Float32).alias("score")
@@ -107,19 +139,33 @@ def build_top_candidates(
             .alias("cand_list")
         )
 
-    top_candidates_df = (
+    per_session_candidates = (
         all_sessions.join(top_candidates, on="session", how="left")
         .with_columns(
             pl.col("cand_list").fill_null(pl.lit([], dtype=pl.List(pl.Int32)))
         )
         .collect(engine="streaming")
     )
-    logger.info("candidate sessions=%d", top_candidates_df.height)
-    return top_candidates_df
+    typed_candidates = pl.concat(
+        [
+            per_session_candidates.with_columns(pl.lit(event_type).alias("type")).select(
+                "type",
+                "session",
+                "cand_list",
+            )
+            for event_type in TYPE_WEIGHTS
+        ]
+    )
+    logger.info(
+        "candidate rows=%d, unique sessions=%d",
+        typed_candidates.height,
+        per_session_candidates.height,
+    )
+    return typed_candidates
 
 
 def evaluate_type(
-    top_candidates: pl.DataFrame,
+    candidates: pl.DataFrame,
     labels: pl.LazyFrame,
     event_type: str,
     k_list: list[int],
@@ -129,7 +175,11 @@ def evaluate_type(
         pl.col("ground_truth").cast(pl.List(pl.Int32)),
     )
 
-    joined = top_candidates.lazy().join(labels_t, on="session", how="inner")
+    candidates_t = candidates.lazy().filter(pl.col("type") == event_type).select(
+        "session",
+        "cand_list",
+    )
+    joined = candidates_t.join(labels_t, on="session", how="inner")
     denom = pl.min_horizontal(pl.col("ground_truth").list.len(), pl.lit(20)).cast(
         pl.Float32
     )
@@ -160,29 +210,25 @@ def main():
     logger = setup_logger(args.exp_name, run_name=SCRIPT_NAME)
     logger.info("*" * 150)
     logger.info("args: %s", args)
-    if args.baseline == "history":
-        logger.info("baseline mode: history (pure session-history, no covisit)")
-    else:
-        logger.info("baseline mode: None (pure covisit)")
+    logger.info("method: %s", args.method)
     logger.info("load_test_data from: %s", TEST_DIR)
     logger.info("load_labels from: %s", LABELS_PATH)
     logger.info("=" * 150)
 
     max_k = max(args.k_list)
-    if args.baseline == "history":
-        covisit = None
+    if args.method == "nn":
+        top_candidates = load_nn_candidates(args.exp_name, max_k, logger)
     else:
-        covisit = load_covisit(args.exp_name, logger)
-    events = load_test_events(logger)
+        covisit = None if args.method == "history" else load_covisit(args.exp_name, logger)
+        events = load_test_events(logger)
+        top_candidates = build_top_candidates(
+            events,
+            covisit,
+            max_k=max_k,
+            logger=logger,
+            method=args.method,
+        )
     labels = load_labels(logger)
-
-    top_candidates = build_top_candidates(
-        events,
-        covisit,
-        max_k=max_k,
-        logger=logger,
-        baseline=args.baseline,
-    )
 
     sessions_evaluated: dict[str, int] = {}
     recall_by_type: dict[str, dict[int, float]] = {}
@@ -227,13 +273,14 @@ def main():
 
     summary = {
         "exp_name": args.exp_name,
-        "baseline": args.baseline,
+        "method": args.method,
         "sessions_evaluated": sessions_evaluated,
         "recall_at": recall_at_output,
     }
 
-    EVAL_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = EVAL_OUT_DIR / f"{args.exp_name}.json"
+    out_dir = EVAL_ROOT / args.method
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{args.exp_name}.json"
     out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     logger.info("saved evaluation summary to %s", out_path)
 
