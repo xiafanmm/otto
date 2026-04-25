@@ -73,23 +73,41 @@ class RuntimeConfig:
 
 def parse_args() -> Args:
     parser = argparse.ArgumentParser(description="Build embedding recall for OTTO.")
+    # 运行模式：train 训练 embedding 召回模型，submit 用训练好的模型做正式推理。
     parser.add_argument("--mode", choices=["train", "submit"], required=True)
+    # 实验名：用于区分日志、模型权重和输出目录。
     parser.add_argument("--exp-name", default="baseline")
+    # 历史序列长度：每条样本向前取多少个事件作为输入上下文。
     parser.add_argument("--n-length", type=int, default=10)
+    # 监督标签长度：每条样本向后取多少个未来事件作为训练目标。
     parser.add_argument("--n-label", type=int, default=10)
+    # 训练时间窗口：只保留最近多少天的事件用于训练。
     parser.add_argument("--days", type=int, default=14)
+    # 商品 aid 的 embedding 维度。
     parser.add_argument("--emb-dim", type=int, default=128)
+    # 时间特征 hour 的 embedding 维度。
     parser.add_argument("--time-emb-dim", type=int, default=32)
+    # 训练 batch size。
     parser.add_argument("--batch-size", type=int, default=4096)
+    # 最大训练轮数。
     parser.add_argument("--n-epoch", type=int, default=5)
+    # AdamW 学习率。
     parser.add_argument("--lr", type=float, default=0.001)
+    # 对比学习温度系数，越小越强调正负样本分数差异。
     parser.add_argument("--temperature", type=float, default=0.05)
+    # 负样本数量系数：每个 batch 至少采样 n_neg_coef * batch_size 个候选负样本。
     parser.add_argument("--n-neg-coef", type=int, default=30)
+    # 负样本最小保底数：即使 batch 很小，也至少采样这么多负样本。
     parser.add_argument("--neg-topk", type=int, default=1000)
+    # 推理时每个 session 每种目标类型保留多少个召回候选。
     parser.add_argument("--topk", type=int, default=200)
+    # clicks 事件的数值权重，同时也作为 clicks 目标的 label_type id。
     parser.add_argument("--click", type=int, default=1)
+    # carts 事件的数值权重，同时也作为 carts 目标的 label_type id。
     parser.add_argument("--cart", type=int, default=3)
+    # orders 事件的数值权重，同时也作为 orders 目标的 label_type id。
     parser.add_argument("--order", type=int, default=6)
+    # 冒烟测试开关：只跑少量 shard / session，并在 1000 step 后提前停止。
     parser.add_argument(
         "--run-test",
         action="store_true",
@@ -202,10 +220,19 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
         ts_max,
         ts_per_hour,
     )
-
+    # n_aid：aid embedding 的总大小 多留了一个，一般 + 2就够了
+    # pad_aid：给“空位/补齐”用的特殊 aid id
+    # pad_h：给“空位/补齐”用的特殊小时桶 id
+    # n_h：小时 embedding 的总大小
     n_aid = aid_max + 3
     pad_aid = n_aid - 1
+    # 除了真实范围，还要额外留出：
+    # +1 一档
+    # +2 一档
+    # 再留一个专门的 pad_h
+    # 这就是为什么这里是 +3。
     pad_h = h_max - h_min + 3
+    # 这是时间 embedding 表的总大小
     n_h = pad_h + 1
 
     logger.info(
@@ -216,10 +243,15 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
         h_max,
         n_h,
     )
-
+    # aid_pre{i}：当前时刻往前第 i 个商品
+    # h_pre{i}：当前时刻往前第 i 个事件对应的小时桶
+    # weight_pre{i}：当前时刻往前第 i 个事件类型权重
     x_cols = [f"aid_pre{i}" for i in range(args.n_length)]
     x_cols += [f"h_pre{i}" for i in range(args.n_length)]
     x_cols += [f"weight_pre{i}" for i in range(args.n_length)]
+
+    # aid_label{i}：当前时刻之后第 i+1 个商品
+    # weight_label{i}：这个未来事件的类型权重
     y_cols = [f"aid_label{i}" for i in range(args.n_label)]
     y_cols += [f"weight_label{i}" for i in range(args.n_label)]
 
@@ -228,21 +260,21 @@ def scan_runtime_config(args: Args, logger) -> RuntimeConfig:
     max_label_weight = max(type_weights.values())
 
     return RuntimeConfig(
-        args=args,
-        n_aid=n_aid,
-        pad_aid=pad_aid,
-        h_min=h_min,
-        h_max=h_max,
-        n_h=n_h,
-        pad_h=pad_h,
-        ts_scale=ts_scale,
-        ts_per_hour=ts_per_hour,
-        ts_per_day=ts_per_day,
-        type_weights=type_weights,
-        label_types=label_types,
-        max_label_weight=max_label_weight,
-        x_cols=x_cols,
-        y_cols=y_cols,
+        args=args,  # 原始命令行超参数，后续训练/推理流程统一从这里读取
+        n_aid=n_aid,  # = aid_max + 3；aid embedding 表大小，覆盖所有真实 aid 并额外留出保留槽位
+        pad_aid=pad_aid,  # = n_aid - 1；aid 的 padding id，历史/标签不足时用它补齐
+        h_min=h_min,  # = 最小小时桶编号；秒级时取 h_min_sec，毫秒级时取 h_min_ms
+        h_max=h_max,  # = 最大小时桶编号；秒级时取 h_max_sec，毫秒级时取 h_max_ms
+        n_h=n_h,  # = pad_h + 1；小时 embedding 表大小，需覆盖真实小时桶和 padding 槽位
+        pad_h=pad_h,  # = (h_max - h_min) + 3；小时桶的 padding id，并为 hour+1/hour+2 预留索引
+        ts_scale=ts_scale,  # = 1000 if ts_max >= 10**12 else 1；自动判断 ts 是毫秒还是秒
+        ts_per_hour=ts_per_hour,  # = 3600 * ts_scale；一个小时对应多少个 ts 单位，用于 ts -> 小时桶
+        ts_per_day=ts_per_day,  # = 86400 * ts_scale；一天对应多少个 ts 单位，用于裁最近 N 天训练数据
+        type_weights=type_weights,  # = {"clicks": args.click, "carts": args.cart, "orders": args.order}
+        label_types=label_types,  # = tuple((name, type_weights[name]) for name in TYPE_NAMES)；固定顺序保存三种目标
+        max_label_weight=max_label_weight,  # = max(type_weights.values())；决定 label_type embedding 表大小
+        x_cols=x_cols,  # = aid_pre* + h_pre* + weight_pre*；输入特征列名，n_length个
+        y_cols=y_cols,  # = aid_label* + weight_label*；监督标签列名，n_label个
     )
 
 
@@ -339,6 +371,10 @@ def preprocess_df(
             ]
         )
     df = df.with_columns(history_exprs)
+    # df columns ~= [session, aid, ts, type, weight, h,
+#                aid_pre0...aid_pre{n_length-1},
+#                h_pre0...h_pre{n_length-1},
+#                weight_pre0...weight_pre{n_length-1}]
 
     if with_label:
         label_exprs: list[pl.Expr] = []
@@ -367,6 +403,15 @@ def preprocess_df(
             .to_numpy(),
             dtype=np.int32,
         )
+        # [
+        #     aid_pre0, aid_pre1, ..., aid_pre(n_length-1),
+        #     h_pre0, h_pre1, ..., h_pre(n_length-1),
+        #     weight_pre0, weight_pre1, ..., weight_pre(n_length-1),
+
+        #     aid_label0, aid_label1, ..., aid_label(n_label-1),
+        #     weight_label0, weight_label1, ..., weight_label(n_label-1),
+        # ]
+
         if arr.size == 0:
             return empty_train_tensor(cfg)
         return torch.from_numpy(arr)
@@ -430,21 +475,26 @@ class Encoder(nn.Module):
 
     def _calc_query_emb(self, x_batch: torch.Tensor) -> torch.Tensor:
         x_batch = x_batch.reshape(-1, 3, self.cfg.args.n_length).transpose(1, 2)
-
+        # [batch, n_length, value]
         aid = x_batch[:, :, 0]
         hour = x_batch[:, :, 1]
         weight = x_batch[:, :, 2].float().unsqueeze(2)
 
         aid_emb = self.emb(aid)
+
+        # “24 小时循环里的位置”
         hour_float = hour.float()
         phase = (hour_float % 24.0) / 24.0 * (2.0 * math.pi)
+        # cyc_feat.shape = [batch, n_length, 2]
         cyc_feat = torch.stack([torch.sin(phase), torch.cos(phase)], dim=2)
 
+        # 用 + 1 和 +2 平滑一下
         hour_max = self.cfg.pad_h
         hour_emb = self.emb_h(torch.clamp(hour, min=0, max=hour_max))
         hour_emb = hour_emb + self.emb_h(torch.clamp(hour + 1, min=0, max=hour_max))
         hour_emb = hour_emb + self.emb_h(torch.clamp(hour + 2, min=0, max=hour_max))
 
+        # x.shape = [batch_size, n_length, emb_dim + 2 + 1 + time_emb_dim]
         x = torch.cat([aid_emb, cyc_feat, weight, hour_emb], dim=2)
         mask = ~aid.eq(self.cfg.pad_aid).unsqueeze(2)
         x = x * mask
@@ -459,12 +509,35 @@ class Encoder(nn.Module):
         return self._calc_query_emb(x_batch) + self.emb_label_type(label_type)
 
     def forward(self, xy_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # xy_batch.shape = [batch_size, len(x_cols) + len(y_cols)]
+        # 每一行的列顺序是：
+        # [
+        #     aid_pre0, aid_pre1, ..., aid_pre(n_length-1),
+        #     h_pre0, h_pre1, ..., h_pre(n_length-1),
+        #     weight_pre0, weight_pre1, ..., weight_pre(n_length-1),
+        # 
+        # 
+        #     aid_label0, aid_label1, ..., aid_label(n_label-1),
+        #     weight_label0, weight_label1, ..., weight_label(n_label-1),
+        # ]
         x_width = len(self.cfg.x_cols)
         aid_label_width = self.cfg.args.n_label
-
+        # x_batch
+        # [
+        #     aid_pre0, aid_pre1, ..., aid_pre(n_length-1),
+        #     h_pre0, h_pre1, ..., h_pre(n_length-1),
+        #     weight_pre0, weight_pre1, ..., weight_pre(n_length-1),
+        # ]
         x_batch = xy_batch[:, :x_width]
+
+        # y_batch 【batch_size, n_label]
+        # aid_label0, aid_label1, ..., aid_label(n_label-1)
         y_batch = xy_batch[:, x_width : x_width + aid_label_width]
-        label_type = xy_batch[:, x_width + aid_label_width :]
+
+        # label_type
+        # weight_label0, weight_label1, ..., weight_label(n_label-1)
+        label_type = xy_batch[:, x_width + aid_label_width :]   # [batch_size, n_label]
 
         batch_size = xy_batch.shape[0]
         neg_count = min(
@@ -472,9 +545,9 @@ class Encoder(nn.Module):
             max(self.cfg.args.neg_topk, self.cfg.args.n_neg_coef * batch_size),
         )
         neg_aids = torch.randperm(self.cfg.n_aid - 1, device=xy_batch.device)[:neg_count]
-
-        query_emb = self._calc_query_emb(x_batch)
-        query_emb = query_emb.unsqueeze(1) + self.emb_label_type(label_type)
+    
+        query_emb = self._calc_query_emb(x_batch)   # [batch_size, emb_dim]
+        query_emb = query_emb.unsqueeze(1) + self.emb_label_type(label_type)    # [batch_size, 1, emb_dim] + [batch_size, n_label, emb_dim] = [batch_size, n_label, emb_dim]
 
         pos_emb = self.do_emb(y_batch)
         neg_emb = self.do_emb(neg_aids)
@@ -482,25 +555,49 @@ class Encoder(nn.Module):
         query_emb = F.normalize(query_emb, dim=2, eps=1e-6)
         pos_emb = F.normalize(pos_emb, dim=2, eps=1e-6)
         neg_emb = F.normalize(neg_emb, dim=1, eps=1e-6)
-
+        
+        # 两个逐元素相乘然后求和
+        # [batch_size, n_label, emb_dim] * [batch_size, n_label, emb_dim]
+        # -> [batch_size, n_label, emb_dim]
+        # sum over dim=2 -> [batch_size, n_label]
         cossim_pos_all = torch.sum(query_emb * pos_emb, dim=2)
+        
+        
         pos_mask = y_batch.eq(self.cfg.pad_aid)
+        # 所有有效未来正样本里，最差的那个相似度
         cossim_pos_min = cossim_pos_all.masked_fill(pos_mask, 1.0).min(dim=1).values
 
+        # 多个未来正样本相似度的加权平均
         label_weight = label_type.float()
+
+        # cossim_pos_all: [batch_size, n_label]
+        # label_weight:   [batch_size, n_label]
+        # elementwise multiply -> [batch_size, n_label]
+        # sum(dim=1) -> [batch_size]
+        # label_weight.sum(dim=1) -> [batch_size]
+        # clamp(..., min=1.0) keeps denominator >= 1.0
+        # final weighted mean -> [batch_size]
         cossim_pos_mean = torch.sum(cossim_pos_all * label_weight, dim=1) / torch.clamp(
             label_weight.sum(dim=1), min=1.0
         )
+
+        # “最差正样本”与“平均正样本”结合
+        # positive sample = pos
         cossim_pos = (cossim_pos_min + cossim_pos_mean) / 2.0
-
-        cossim_neg = torch.matmul(query_emb[:, 0], neg_emb.T)
+        
+        # 算负样本分数
+        # 正样本这边：认真聚合了所有 future labels
+        # 负样本这边：只拿第一个 label-conditioned query 去打分
+        cossim_neg = torch.matmul(query_emb[:, 0], neg_emb.T)   
         hard_neg_k = min(self.cfg.args.neg_topk, cossim_neg.shape[1])
-        cossim_neg = torch.topk(cossim_neg, hard_neg_k, dim=1).values
+        cossim_neg = torch.topk(cossim_neg, hard_neg_k, dim=1).values   #cossim_neg.shape == [batch_size, hard_neg_k]
 
-        logits = torch.cat([cossim_pos.unsqueeze(1), cossim_neg], dim=1)
+        logits = torch.cat([cossim_pos.unsqueeze(1), cossim_neg], dim=1)    # logits.shape == [batch_size, 1 + hard_neg_k]
         logits = logits / self.cfg.args.temperature
         log_prob = F.log_softmax(logits, dim=1)
+        # loss：要求第 0 个位置概率最大
         loss = -log_prob[:, 0].mean()
+        # 看模型有没有把第 0 个位置选成最大
         acc = (log_prob.argmax(dim=1) == 0).float().mean()
         return loss, acc
 
@@ -512,6 +609,7 @@ class MyOptimizer:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
+            # 只有商品 aid 的大 embedding 表单独拿出来
             if name.endswith("emb.weight"):
                 params_emb.append(param)
             else:
@@ -584,7 +682,7 @@ def train_one_epoch(
         for indices in np.array_split(np.random.permutation(xy.shape[0]), n_split):
             if len(indices) < 2:
                 continue
-
+            
             xy_batch = xy[indices].to(device=device, non_blocking=True).long()
             optimizer.zero_grad()
             loss, acc = model(xy_batch)
@@ -782,9 +880,11 @@ def main():
         args.run_test,
     )
 
+    # 获得截断的时间
     cutoff_ts = scan_train_cutoff_ts(train_files, cfg, logger)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 让 cuDNN 在 GPU 上自动试几种实现算法，然后为当前这种张量形状选择更快的那个。
     torch.backends.cudnn.benchmark = True
     logger.info("device=%s", device)
 
